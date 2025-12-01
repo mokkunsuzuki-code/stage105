@@ -1,126 +1,88 @@
-"""
-qs_tls_common.py - QS-TLS (Quantum-Secure Mini TLS) 共通ユーティリティ
+from __future__ import annotations
 
-Stage102/103:
-  - レコードタイプにディレクトリ同期用を追加
-  - アプリケーションデータ / ファイルチャンク / マニフェストの暗号化を共通化
-"""
+import json
+import struct
+import time
+from typing import Dict, List, Tuple
 
-import socket
-from typing import Tuple
-
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
-
-from crypto_utils import encrypt_aes_gcm, decrypt_aes_gcm, b64e, b64d
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
-# ======== レコードタイプ定義（TLS風） ========
+# ============================================
+# QS-TLS Record Utilities (Stage105)
+#  - seq 番号付きレコード
+#  - AES-GCM で暗号化
+#  - 再送制御マネージャ
+# ============================================
 
-RECORD_TYPE_ALERT = 21            # 警告 / 終了
-RECORD_TYPE_HANDSHAKE = 22        # ハンドシェイクメッセージ（JSON）
-RECORD_TYPE_APPLICATION_DATA = 23 # アプリケーションデータ（暗号化テキスト）
-RECORD_TYPE_KEY_UPDATE = 24       # 鍵更新通知
-RECORD_TYPE_FILE_META = 25        # ファイル情報（ファイル名・サイズ・ハッシュなど）
-RECORD_TYPE_FILE_CHUNK = 26       # ファイル本体データ（分割チャンク）
-RECORD_TYPE_DIR_MANIFEST = 27     # ディレクトリ全体のマニフェスト（JSON）
-
-
-# ======== レコード送受信 ========
-
-def send_record(conn: socket.socket, record_type: int, payload: bytes) -> None:
+def build_record(seq: int, rtype: str, key: bytes, payload: Dict) -> bytes:
     """
-    Record Header (3 bytes) + Payload を送信
-    - record_type: 1 byte
-    - length: 2 bytes (big endian)
-    """
-    if not isinstance(payload, (bytes, bytearray)):
-        raise TypeError("payload must be bytes")
+    QS-TLS Record を作成して AES-GCM で暗号化する。
 
-    if not (0 <= record_type <= 255):
-        raise ValueError("record_type must fit in 1 byte")
-
-    length = len(payload)
-    if length > 0xFFFF:
-        raise ValueError("payload too long (max 65535 bytes)")
-
-    header = bytes([record_type]) + length.to_bytes(2, "big")
-    conn.sendall(header + payload)
-
-
-def _recv_exact(conn: socket.socket, n: int) -> bytes:
-    buf = b""
-    while len(buf) < n:
-        chunk = conn.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("接続が途中で切断されました。")
-        buf += chunk
-    return buf
-
-
-def recv_record(conn: socket.socket) -> Tuple[int, bytes]:
-    """
-    1レコードを受信して (record_type, payload_bytes) を返す
-    """
-    header = _recv_exact(conn, 3)
-    record_type = header[0]
-    length = int.from_bytes(header[1:3], "big")
-    payload = _recv_exact(conn, length)
-    return record_type, payload
-
-
-# ======== アプリケーションデータ／ファイルチャンク／マニフェストの暗号化・復号 ========
-
-def encrypt_app_data(aes_key: bytes, plaintext: bytes) -> bytes:
-    """
-    データを AES-GCM で暗号化し、JSONバイト列として返す。
-
-    JSON構造:
-      {
-        "nonce": "<base64>",
-        "ciphertext": "<base64>"
-      }
-
-    アプリケーションデータ／ファイルチャンク／マニフェストなどに共通利用。
-    """
-    import json
-
-    ct, nonce = encrypt_aes_gcm(aes_key, plaintext, aad=None)
-    obj = {
-        "nonce": b64e(nonce),
-        "ciphertext": b64e(ct),
+    header = {
+        "seq": seq,
+        "type": rtype,
+        "payload": payload,
     }
-    return json.dumps(obj).encode("utf-8")
-
-
-def decrypt_app_data(aes_key: bytes, payload: bytes) -> bytes:
     """
-    encrypt_app_data で作った JSON ペイロードを復号して平文バイト列を返す。
+    header = {
+        "seq": seq,
+        "type": rtype,
+        "payload": payload,
+    }
+    plaintext = json.dumps(header).encode("utf-8")
+
+    aes = AESGCM(key)
+    # seq を 64bit にパックし、12バイトの nonce に拡張（先頭ゼロ埋め）
+    nonce = struct.pack("!Q", seq).rjust(12, b"\x00")
+    ciphertext = aes.encrypt(nonce, plaintext, None)
+    return ciphertext
+
+
+def parse_record(seq: int, key: bytes, ciphertext: bytes) -> Dict:
     """
-    import json
-
-    obj = json.loads(payload.decode("utf-8"))
-    nonce = b64d(obj["nonce"])
-    ct = b64d(obj["ciphertext"])
-    return decrypt_aes_gcm(aes_key, ct, nonce, aad=None)
-
-
-# ======== 鍵更新 (KeyUpdate) ========
-
-def update_application_key(current_key: bytes) -> bytes:
+    受信したレコードを AES-GCM で復号し、dict に戻す。
+    復号に使う nonce は送信側と同じく seq から生成する。
     """
-    現在のアプリケーション鍵から、新しい鍵を導出する。
-    - TLS1.3 の KeyUpdate に相当するイメージ。
-    - 実装: HKDF(salt=current_key, ikm="key-update") → new_key
-    """
-    if not current_key:
-        raise ValueError("current_key is empty")
+    aes = AESGCM(key)
+    nonce = struct.pack("!Q", seq).rjust(12, b"\x00")
+    plaintext = aes.decrypt(nonce, ciphertext, None)
+    header = json.loads(plaintext.decode("utf-8"))
+    return header
 
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=len(current_key),
-        salt=current_key,
-        info=b"qs-tls-1.0 key update",
-    )
-    new_key = hkdf.derive(b"key-update")
-    return new_key
+
+class RetransmissionManager:
+    """
+    シンプルな再送制御クラス（Stage105用）
+
+    - 送信したレコードを waiting に登録
+    - 一定時間 ACK が来なければ再送対象として返す
+    - ACK を受けたら waiting から削除
+    """
+
+    def __init__(self, timeout_sec: float = 2.0):
+        self.waiting: Dict[int, Dict] = {}  # seq → {"cipher":..., "timestamp":...}
+        self.timeout_sec = timeout_sec
+
+    def register(self, seq: int, cipher: bytes) -> None:
+        self.waiting[seq] = {
+            "cipher": cipher,
+            "timestamp": time.time(),
+        }
+
+    def ack(self, seq: int) -> None:
+        if seq in self.waiting:
+            del self.waiting[seq]
+
+    def get_retransmits(self) -> List[Tuple[int, bytes]]:
+        """
+        timeout_sec 経過しても ACK が来ていないものを再送対象として返す。
+        """
+        now = time.time()
+        resend: List[Tuple[int, bytes]] = []
+        for seq, data in list(self.waiting.items()):
+            if now - data["timestamp"] > self.timeout_sec:
+                resend.append((seq, data["cipher"]))
+                # タイムスタンプを更新して、連続再送しすぎないようにする
+                data["timestamp"] = now
+        return resend
