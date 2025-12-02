@@ -1,123 +1,154 @@
-from __future__ import annotations
+# qs_tls_server.py
+#
+# QS-TLS Stage106 サーバー側
+# - QKD(final_key.bin) + X25519(ECDH) + HKDF で AES-256-GCM鍵を生成
+# - 暗号化チャット
+# - Heartbeat(ハートビート) に対して ACK を返す
 
 import socket
 import threading
-from typing import Tuple
+import time
+import json
 
-from crypto_utils import load_qkd_key, derive_hybrid_key
-from qs_tls_common import build_record, parse_record, RetransmissionManager
+from crypto_utils import load_qkd_key, derive_hybrid_aes_key, derive_shared_secret
+from qs_tls_common import (
+    send_record,
+    recv_record,
+    MSG_TYPE_CHAT,
+    MSG_TYPE_HEARTBEAT,
+    MSG_TYPE_HEARTBEAT_ACK,
+    MSG_TYPE_QUIT,
+)
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives import serialization
 
 
 HOST = "127.0.0.1"
-PORT = 50400
+PORT = 50506
 
 
-def client_handler(conn: socket.socket, addr: Tuple[str, int], aes_key: bytes) -> None:
+def perform_handshake_server(conn) -> bytes:
     """
-    クライアント1台分のハンドラ。
-    Stage105 では以下を行う：
-      - seq 番号付きのメッセージ受信
-      - ACK の送信
-      - 再送要求への対応（サーバー側からの送信は今回は最小限）
+    サーバー側ハンドシェイク:
+    - X25519 鍵ペア生成
+    - 公開鍵をクライアントへ送信
+    - クライアントの公開鍵を受信
+    - QKD鍵 + ECDH秘密 から AES鍵を導出
     """
-    print(f"[Server] ハンドシェイク完了。クライアント {addr} と通信開始")
+    print("[Server] Handshake: start")
 
-    rtx = RetransmissionManager()
-    seq_send = 1      # サーバー → クライアント
-    seq_recv = 1      # クライアント → サーバー
+    # 1) サーバー X25519 鍵ペア生成
+    server_priv = x25519.X25519PrivateKey.generate()
+    server_pub_bytes = server_priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+    # 2) サーバー公開鍵をクライアントへ送信
+    conn.sendall(server_pub_bytes)
+    print("[Server] Sent server X25519 public key")
+
+    # 3) クライアント公開鍵を受信
+    client_pub_bytes = _recv_exact(conn, 32)
+    if not client_pub_bytes:
+        raise ConnectionError("failed to receive client public key")
+    print("[Server] Received client X25519 public key")
+
+    # 4) ECDH共有秘密を計算
+    shared_secret = derive_shared_secret(server_priv, client_pub_bytes)
+
+    # 5) QKD鍵を読み込み
+    qkd_key = load_qkd_key()
+
+    # 6) ハイブリッド鍵から AES-256 鍵を導出
+    aes_key = derive_hybrid_aes_key(qkd_key, shared_secret)
+    print("[Server] Handshake: AES key derived")
+
+    return aes_key
+
+
+def _recv_exact(conn, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = conn.recv(size - len(data))
+        if not chunk:
+            return b""
+        data += chunk
+    return data
+
+
+def handle_client(conn, addr):
+    try:
+        aes_key = perform_handshake_server(conn)
+    except Exception as e:
+        print(f"[Server] Handshake failed with {addr}: {e}")
+        conn.close()
+        return
+
+    print(f"[Server] Handshake complete with {addr}. Encrypted session started.")
 
     while True:
-        # 必要な再送があれば送る（今回はサーバーから送るケースは少ないが形だけ用意）
-        for rseq, rcipher in rtx.get_retransmits():
-            try:
-                conn.sendall(rcipher)
-                print(f"[Server][RTX] seq={rseq} を再送")
-            except OSError:
-                print("[Server] 再送時に接続エラーが発生しました。終了します。")
-                conn.close()
-                return
-
         try:
-            data = conn.recv(4096)
-        except ConnectionResetError:
-            print("[Server] クライアントが切断しました（ConnectionResetError）。")
+            msg = recv_record(conn, aes_key)
+        except ConnectionError:
+            print(f"[Server] Connection closed from {addr}")
             break
-
-        if not data:
-            # 空読みは無視して継続
-            continue
-
-        # 受信データを復号
-        try:
-            rec = parse_record(seq_recv, aes_key, data)
         except Exception as e:
-            print(f"[Server] 復号エラー: {e}")
+            print(f"[Server] Error while receiving from {addr}: {e}")
             break
 
-        seq_recv += 1
-        rtype = rec.get("type")
-        payload = rec.get("payload", {})
+        mtype = msg.get("type")
+        payload = msg.get("payload", {})
 
-        if rtype == "ACK":
-            # サーバー側から送信したメッセージに対するACK（今回はほぼ使わない）
-            ack_seq = payload.get("ack")
-            rtx.ack(ack_seq)
-            print(f"[Server] ACK 受信: ack={ack_seq}")
-            continue
+        if mtype == MSG_TYPE_QUIT:
+            print(f"[Server] Client {addr} requested quit.")
+            break
 
-        if rtype == "MSG":
+        elif mtype == MSG_TYPE_HEARTBEAT:
+            # ---- Stage106: Heartbeat を受信したら ACK で応答 ----
+            orig_ts = payload.get("timestamp")
+            now = time.time()
+            print(f"[Server] Heartbeat received from {addr}. client_ts={orig_ts}, server_ts={now}")
+
+            ack_msg = {
+                "type": MSG_TYPE_HEARTBEAT_ACK,
+                "payload": {
+                    "orig_timestamp": orig_ts,
+                    "server_timestamp": now,
+                },
+            }
+            send_record(conn, aes_key, ack_msg)
+            print(f"[Server] Heartbeat ACK sent to {addr}.")
+
+        elif mtype == MSG_TYPE_CHAT:
             text = payload.get("text", "")
-            print(f"[Server] Client → Server: {text}")
+            print(f"[Server] Chat from {addr}: {text}")
 
-            # 受信したメッセージに対する ACK を返す
-            ack_cipher = build_record(
-                seq_send,
-                "ACK",
-                aes_key,
-                {"ack": rec.get("seq")}  # 受信したレコードの seq をそのまま返す
-            )
-            try:
-                conn.sendall(ack_cipher)
-            except OSError:
-                print("[Server] ACK 送信時に接続エラー。終了します。")
-                break
-            seq_send += 1
+            # 必要ならエコー返信
+            # reply = {
+            #     "type": MSG_TYPE_CHAT,
+            #     "payload": {"text": f"Echo: {text}"},
+            # }
+            # send_record(conn, aes_key, reply)
 
         else:
-            print(f"[Server] 未知のレコードタイプを受信: {rtype}")
+            print(f"[Server] Unknown message type from {addr}: {mtype}")
 
     conn.close()
-    print(f"[Server] クライアント {addr} との接続を終了しました。")
+    print(f"[Server] Connection closed: {addr}")
 
 
-def run_server() -> None:
-    """
-    Stage105 サーバー起動関数。
-    - QKD鍵を読み込み
-    - ダミー共有秘密（今後 X25519 に置き換え可能）
-    - ハイブリッド鍵を生成
-    - クライアント接続ごとにスレッドを立てて client_handler を実行
-    """
-    # QKD鍵読み込み
-    qkd_key = load_qkd_key()
-    # まだ ECDH を入れていないので、shared_secret はダミー
-    dummy_shared_secret = b"A" * 32
-    aes_key = derive_hybrid_key(qkd_key, dummy_shared_secret)
+def run_server():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((HOST, PORT))
+        s.listen(5)
+        print(f"[Server] Listening on {HOST}:{PORT}")
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind((HOST, PORT))
-    s.listen(5)
-    print(f"[Server] Listening on {HOST}:{PORT} ...")
-
-    try:
         while True:
             conn, addr = s.accept()
-            print(f"[Server] 接続受理: {addr}")
-            th = threading.Thread(target=client_handler, args=(conn, addr, aes_key), daemon=True)
+            print(f"[Server] New connection from {addr}")
+            th = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
             th.start()
-    finally:
-        s.close()
-        print("[Server] サーバーソケットを閉じました。")
 
 
 if __name__ == "__main__":

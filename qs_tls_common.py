@@ -1,88 +1,91 @@
-from __future__ import annotations
+# qs_tls_common.py
+#
+# QS-TLS Stage106 共通ユーティリティ
+# - AES-256-GCM での暗号化/復号
+# - 長さプレフィックス付きのレコード送受信
+# - メッセージ種別: chat / heartbeat / heartbeat_ack / quit
 
 import json
+import os
 import struct
-import time
-from typing import Dict, List, Tuple
+from typing import Tuple, Dict, Any
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
-# ============================================
-# QS-TLS Record Utilities (Stage105)
-#  - seq 番号付きレコード
-#  - AES-GCM で暗号化
-#  - 再送制御マネージャ
-# ============================================
+# ----- メッセージタイプ定義 -----
+MSG_TYPE_CHAT = "chat"
+MSG_TYPE_HEARTBEAT = "heartbeat"
+MSG_TYPE_HEARTBEAT_ACK = "heartbeat_ack"
+MSG_TYPE_QUIT = "quit"
 
-def build_record(seq: int, rtype: str, key: bytes, payload: Dict) -> bytes:
+
+def encrypt_message(key: bytes, message: Dict[str, Any]) -> bytes:
     """
-    QS-TLS Record を作成して AES-GCM で暗号化する。
-
-    header = {
-        "seq": seq,
-        "type": rtype,
-        "payload": payload,
-    }
+    message(dict) を JSON エンコードして AES-GCM で暗号化。
+    返り値: nonce(12byte) + ciphertext
     """
-    header = {
-        "seq": seq,
-        "type": rtype,
-        "payload": payload,
-    }
-    plaintext = json.dumps(header).encode("utf-8")
-
     aes = AESGCM(key)
-    # seq を 64bit にパックし、12バイトの nonce に拡張（先頭ゼロ埋め）
-    nonce = struct.pack("!Q", seq).rjust(12, b"\x00")
+    nonce = os.urandom(12)
+    plaintext = json.dumps(message).encode("utf-8")
     ciphertext = aes.encrypt(nonce, plaintext, None)
-    return ciphertext
+    return nonce + ciphertext
 
 
-def parse_record(seq: int, key: bytes, ciphertext: bytes) -> Dict:
+def decrypt_message(key: bytes, data: bytes) -> Dict[str, Any]:
     """
-    受信したレコードを AES-GCM で復号し、dict に戻す。
-    復号に使う nonce は送信側と同じく seq から生成する。
+    nonce(12) + ciphertext 形式のデータを復号して dict を返す。
     """
+    if len(data) < 12:
+        raise ValueError("data too short")
+
+    nonce = data[:12]
+    ciphertext = data[12:]
     aes = AESGCM(key)
-    nonce = struct.pack("!Q", seq).rjust(12, b"\x00")
     plaintext = aes.decrypt(nonce, ciphertext, None)
-    header = json.loads(plaintext.decode("utf-8"))
-    return header
+    return json.loads(plaintext.decode("utf-8", errors="replace"))
 
 
-class RetransmissionManager:
+def send_record(sock, key: bytes, message: Dict[str, Any]) -> None:
     """
-    シンプルな再送制御クラス（Stage105用）
-
-    - 送信したレコードを waiting に登録
-    - 一定時間 ACK が来なければ再送対象として返す
-    - ACK を受けたら waiting から削除
+    長さプレフィックス付きレコードを送信。
+    [4byte length][nonce+ciphertext]
     """
+    enc = encrypt_message(key, message)
+    header = struct.pack("!I", len(enc))
+    sock.sendall(header + enc)
 
-    def __init__(self, timeout_sec: float = 2.0):
-        self.waiting: Dict[int, Dict] = {}  # seq → {"cipher":..., "timestamp":...}
-        self.timeout_sec = timeout_sec
 
-    def register(self, seq: int, cipher: bytes) -> None:
-        self.waiting[seq] = {
-            "cipher": cipher,
-            "timestamp": time.time(),
-        }
+def recv_record(sock, key: bytes) -> Dict[str, Any]:
+    """
+    1レコード分を受信して復号して dict を返す。
+    """
+    # まず長さ(4byte)を読む
+    header = _recv_exact(sock, 4)
+    if not header:
+        raise ConnectionError("socket closed while reading length")
 
-    def ack(self, seq: int) -> None:
-        if seq in self.waiting:
-            del self.waiting[seq]
+    (length,) = struct.unpack("!I", header)
+    if length <= 0:
+        raise ValueError("invalid record length")
 
-    def get_retransmits(self) -> List[Tuple[int, bytes]]:
-        """
-        timeout_sec 経過しても ACK が来ていないものを再送対象として返す。
-        """
-        now = time.time()
-        resend: List[Tuple[int, bytes]] = []
-        for seq, data in list(self.waiting.items()):
-            if now - data["timestamp"] > self.timeout_sec:
-                resend.append((seq, data["cipher"]))
-                # タイムスタンプを更新して、連続再送しすぎないようにする
-                data["timestamp"] = now
-        return resend
+    enc = _recv_exact(sock, length)
+    if not enc:
+        raise ConnectionError("socket closed while reading payload")
+
+    return decrypt_message(key, enc)
+
+
+def _recv_exact(sock, size: int) -> bytes:
+    """
+    指定バイト数を受信（それ以下なら None）。
+    """
+    chunks = []
+    total = 0
+    while total < size:
+        chunk = sock.recv(size - total)
+        if not chunk:
+            return b""
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)

@@ -1,84 +1,40 @@
-from __future__ import annotations
+# crypto_utils.py
+#
+# Stage106 ハイブリッド鍵生成ユーティリティ
+# QKD鍵(final_key.bin) + X25519(ECDH) を HKDF で混合して
+# AES-256-GCM の鍵を生成する
 
 from pathlib import Path
-
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import hashes, serialization
 
-# QKDで生成された最終鍵ファイルのパス
-QKD_KEY_PATH = Path("final_key.bin")
+FINAL_KEY_PATH = Path("final_key.bin")
 
 
-# ==============================
-# QKD 鍵関連
-# ==============================
-
-def load_qkd_key(path: str | Path = QKD_KEY_PATH) -> bytes:
-    """
-    QKDで生成された final_key.bin を読み込むヘルパー関数。
-    32バイト以上あることを簡易チェックする。
-    """
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"QKD鍵ファイルが見つかりません: {p}")
-
-    data = p.read_bytes()
+def load_qkd_key(path: Path = FINAL_KEY_PATH) -> bytes:
+    """QKD 最終鍵を読み込む（32バイトに調整）"""
+    data = path.read_bytes()
     if len(data) < 32:
-        raise ValueError(f"QKD鍵が短すぎます ({len(data)} バイト)。32バイト以上が必要です。")
+        data = data.ljust(32, b"\x00")
+    return data[:32]
 
-    return data
+
+def derive_shared_secret(private_key: x25519.X25519PrivateKey, peer_pub_bytes: bytes) -> bytes:
+    """X25519 の共有秘密を導出"""
+    peer_pub = x25519.X25519PublicKey.from_public_bytes(peer_pub_bytes)
+    return private_key.exchange(peer_pub)
 
 
-# ==============================
-# ハイブリッド鍵導出 (QKD + ECDH共有秘密)
-# ==============================
-
-def derive_hybrid_key(
-    qkd_key: bytes,
-    shared_secret: bytes,
-    *,
-    length: int = 32,
-    info: bytes = b"qs-tls-1.0 hybrid key",
-) -> bytes:
+def derive_hybrid_aes_key(qkd_key: bytes, ecdh_secret: bytes, length: int = 32) -> bytes:
     """
-    QKD鍵(qkd_key) と ECDH共有秘密(shared_secret) を HKDF でミックスして、
-    AES-256 で利用する 32バイトのハイブリッドセッション鍵を生成する。
-
-    Stage105 では shared_secret としてダミー値 (b"A"*32 など) を使ってもOK。
-    将来的に X25519 の実際の共有秘密を入れれば、そのまま拡張できる。
+    QKD鍵 + ECDH共有秘密 → ハイブリッド鍵 → AES-256鍵を HKDF で導出
     """
-    if not isinstance(qkd_key, (bytes, bytearray)):
-        raise TypeError("qkd_key は bytes である必要があります。")
-    if not isinstance(shared_secret, (bytes, bytearray)):
-        raise TypeError("shared_secret は bytes である必要があります。")
-
+    ikm = qkd_key + ecdh_secret  # これがハイブリッド鍵の"材料"
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=length,
-        salt=qkd_key,  # 量子鍵を salt として利用
-        info=info,     # プロトコル識別用のコンテキスト
+        salt=None,
+        info=b"qs-tls-stage106",
     )
-    return hkdf.derive(shared_secret)
-
-
-# ==============================
-# AES-GCM ユーティリティ（必要なら使用）
-# ==============================
-
-def encrypt_aes_gcm(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes | None = None) -> bytes:
-    """
-    AES-GCM で暗号化するシンプルなヘルパー。
-    qs_tls_common.py では直接 AESGCM を使っているが、
-    他のモジュールから利用したいとき用。
-    """
-    aes = AESGCM(key)
-    return aes.encrypt(nonce, plaintext, aad)
-
-
-def decrypt_aes_gcm(key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes | None = None) -> bytes:
-    """
-    AES-GCM 復号用ヘルパー。
-    """
-    aes = AESGCM(key)
-    return aes.decrypt(nonce, ciphertext, aad)
+    return hkdf.derive(ikm)
