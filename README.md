@@ -1,6 +1,6 @@
 📘 QS-TLS Stage106 – Encrypted Messaging with Hybrid Quantum-Secure Key Exchange
 
-🄫 2024 Motohiro Suzuki
+🄫 2025 Motohiro Suzuki
 Licensed under the MIT License
 ━━━━━━━━━━━━━━━━━━
 
